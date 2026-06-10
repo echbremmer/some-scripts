@@ -1,3 +1,5 @@
+Bash
+
 #!/bin/bash
 
 # --- Configuration ---
@@ -29,7 +31,7 @@ TOKEN_RESPONSE=$(curl -s \
   -d "grant_type=password" \
   -d "mfa_token=$MFA_CODE")
 
-# Extract access token using sed
+# Extract access token
 ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
 if [ -z "$ACCESS_TOKEN" ]; then
@@ -43,44 +45,41 @@ echo "Authenticated successfully! Fetching deployments..."
 DEPLOYMENTS_JSON=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
   "$MGMT_URL/organizations/$ORGANIZATION/environments/$ENVIRONMENT/deployments")
 
-# Parse proxy names and their active revisions using sed/awk.
-# This flattens the JSON array block so we can match pair mappings.
-PARSED_DEPLOYMENTS=$(echo "$DEPLOYMENTS_JSON" | sed 's/},{"/\n/g')
-
 echo "----------------------------------------------------------------------"
 printf "%-35s %-10s %-s\n" "PROXY NAME" "REVISION" "BASEPATH"
 echo "----------------------------------------------------------------------"
 
-# Extract each unique proxy block
-echo "$PARSED_DEPLOYMENTS" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\(.*\)"/\1/' | while read -r PROXY_NAME; do
-    [ -z "$PROXY_NAME" ] && continue
+# Separate the payload by individual "aPIProxy" blocks by injecting newlines
+# This prevents cross-contamination between different proxies' fields
+echo "$DEPLOYMENTS_JSON" | sed 's/{"name"/\n{"name"/g' | while read -r PROXY_BLOCK; do
+    # Skip lines that don't actually contain a proxy definition
+    [[ "$PROXY_BLOCK" != *"\"name\""* ]] && continue
 
-    # Extract the revision associated with this specific proxy name from the deployment string
-    # Matches the specific block containing the proxy name to safely retrieve its exact paired revision
-    REV=$(echo "$PARSED_DEPLOYMENTS" | grep "\"name\"[[:space:]]*:[[:space:]]*\"$PROXY_NAME\"" | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*[[{]*[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p')
+    # Extract the Proxy Name (guaranteed to be the first name key in the isolated block)
+    PROXY_NAME=$(echo "$PROXY_BLOCK" | sed -n 's/^.*{"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     
-    if [ -z "$REV" ]; then
-        # Alternative fallback pattern for flat array string mappings
-        REV=$(echo "$PARSED_DEPLOYMENTS" | grep "\"name\"[[:space:]]*:[[:space:]]*\"$PROXY_NAME\"" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' | head -n 1)
-    fi
+    # Extract the Revision Number (specifically targets the text inside the "revision" array nested block)
+    REV=$(echo "$PROXY_BLOCK" | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*[[{]*[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p')
 
-    [ -z "$REV" ] && continue
+    # Guard check to ensure we parsed both values successfully
+    if [ -z "$PROXY_NAME" ] || [ -z "$REV" ]; then
+        continue
+    fi
 
     # 2. Fetch the proxy revision endpoint payload to get the basepath
     PROXY_DETAILS=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
       "$MGMT_URL/organizations/$ORGANIZATION/apis/$PROXY_NAME/revisions/$REV")
 
-    # Extract basepath targets from the configuration fields or raw proxyEndpoints layout
+    # Extract basepath fields reliably
     BASEPATHS=$(echo "$PROXY_DETAILS" | sed 's/,"/\n/g' | grep '"basepath"' | sed -n 's/.*"basepath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr '\n' ',' | sed 's/,$//')
 
-    if [ -z "$BASEPATHS" ]; then
-        # Fallback to look inside the array endpoints configuration block structure if nested
+    # Fallback structure logic if nested deep inside proxyEndpoints array strings
+    if [ -z "$BASEPATHS" ] || [ "$BASEPATHS" = "null" ]; then
         BASEPATHS=$(echo "$PROXY_DETAILS" | sed 's/ proxyEndpoints/\nproxyEndpoints/g' | grep -o '"/.*"' | tr -d '"' | tr '\n' ',' | sed 's/,$//')
     fi
 
-    # Fallback to display standard default if empty
     if [ -z "$BASEPATHS" ]; then BASEPATHS="/"; fi
 
-    # Output row results nicely structured
+    # Output row results cleanly
     printf "%-35s %-10s %-s\n" "$PROXY_NAME" "$REV" "$BASEPATHS"
 done
