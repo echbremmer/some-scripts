@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# --- Configuration ---
+MGMT_URL="https://api.enterprise.apigee.com/v1"
+LOGIN_URL="https://login.apigee.com/oauth/token"
+
+ORGANIZATION="your-org-name"
+ENVIRONMENT="your-env-name"
+USERNAME="your-email@example.com"
+
+# --- Authentication with MFA ---
+echo -n "Enter password for $USERNAME: "
+read -s PASSWORD
+echo ""
+echo -n "Enter 6-digit MFA Code: "
+read -r MFA_CODE
+echo ""
+
+echo "Exchanging credentials for an OAuth2 Bearer token..."
+
+# Fetch the OAuth2 token using the Edge CLI client identifier
+TOKEN_RESPONSE=$(curl -s \
+  -H "Content-Type: application/x-www-form-urlencoded;charset=utf-8" \
+  -H "Accept: application/json;charset=utf-8" \
+  -H "Authorization: Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0" \
+  -X POST "$LOGIN_URL" \
+  -d "username=$USERNAME" \
+  -d "password=$PASSWORD" \
+  -d "grant_type=password" \
+  -d "mfa_token=$MFA_CODE")
+
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+
+if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+    echo "Authentication failed. Please verify your password and MFA code."
+    echo "API Error Details:"
+    echo "$TOKEN_RESPONSE" | jq .
+    exit 1
+fi
+
+echo "Authenticated successfully! Fetching deployed proxies..."
+
+# 1. Get all deployed proxies using the Bearer token
+DEPLOYMENTS_JSON=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+  "$MGMT_URL/organizations/$ORGANIZATION/environments/$ENVIRONMENT/deployments")
+
+# Extract proxy names
+PROXIES=$(echo "$DEPLOYMENTS_JSON" | jq -r '.aPIProxy[].name')
+
+if [ -z "$PROXIES" ]; then
+    echo "No deployed proxies found in environment '$ENVIRONMENT'."
+    exit 0
+fi
+
+echo "--------------------------------------------------"
+printf "%-30s %-10s %-s\n" "PROXY NAME" "REVISION" "BASEPATH"
+echo "--------------------------------------------------"
+
+# 2. Loop through each deployed proxy to find its basepath
+echo "$PROXIES" | while read -r PROXY_NAME; do
+    [ -z "$PROXY_NAME" ] && continue
+
+    # Extract the active revision number for this specific proxy
+    REVISION=$(echo "$DEPLOYMENTS_JSON" | jq -r --arg proxy "$PROXY_NAME" '.aPIProxy[] | select(.name==$proxy) | .revision[].name')
+
+    for REV in $REVISION; do
+        
+        # 3. Fetch the proxy revision details using the Bearer token
+        PROXY_DETAILS=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+          "$MGMT_URL/organizations/$ORGANIZATION/apis/$PROXY_NAME/revisions/$REV")
+        
+        # Extract the basepath from the configuration block
+        BASEPATHS=$(echo "$PROXY_DETAILS" | jq -r '.configuration.proxyEndpoints[]?' | paste -sd ", " -)
+        
+        # Fallback block if the schema is flat in your org version
+        if [ -z "$BASEPATHS" ] || [ "$BASEPATHS" = "null" ]; then
+             BASEPATHS=$(echo "$PROXY_DETAILS" | jq -r '.proxyEndpoints[]' 2>/dev/null | paste -sd ", " -)
+        fi
+
+        printf "%-30s %-10s %-s\n" "$PROXY_NAME" "$REV" "$BASEPATHS"
+    done
+done
