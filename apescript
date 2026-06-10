@@ -1,111 +1,78 @@
-#!/bin/bash
+# --- Authentication with MFA ---
+echo -n "Enter password for $USERNAME: "
+read -s PASSWORD
+echo ""
+echo -n "Enter 6-digit MFA Code: "
+read -r MFA_CODE
+echo ""
 
-# --- Configuration ---
-MGMT_URL="https://api.enterprise.apigee.com/v1"
-LOGIN_URL="https://login.apigee.com/oauth/token"
-CACHE_FILE=".apigee_token_cache"
+echo "Exchanging credentials for an OAuth2 Bearer token..."
 
-ORGANIZATION="your-org-name"
-ENVIRONMENT="your-env-name"
-USERNAME="your-email@example.com"
+TOKEN_RESPONSE=$(curl -s \
+  -H "Content-Type: application/x-www-form-urlencoded;charset=utf-8" \
+  -H "Accept: application/json;charset=utf-8" \
+  -H "Authorization: Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0" \
+  -X POST "$LOGIN_URL" \
+  -d "username=$USERNAME" \
+  -d "password=$PASSWORD" \
+  -d "grant_type=password" \
+  -d "mfa_token=$MFA_CODE")
 
-# --- Token Validation Function ---
-is_token_valid() {
-    local token=$1
-    if [ -z "$token" ]; then return 1; fi
-    
-    # Test the token with a lightweight API call (listing environments)
-    local test_call
-    test_call=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $token" "$MGMT_URL/organizations/$ORGANIZATION/environments")
-    
-    if [ "$test_call" = "200" ]; then
-        return 0 # Token is valid
-    else
-        return 1 # Token is expired or invalid
-    fi
-}
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
 
-# --- Authentication Logic ---
-ACCESS_TOKEN=""
-
-# Try to load token from cache
-if [ -f "$CACHE_FILE" ]; then
-    printf "Found cached token. Checking validity... "
-    SAVED_TOKEN=$(cat "$CACHE_FILE")
-    
-    if is_token_valid "$SAVED_TOKEN"; then
-        echo "Valid! Skipping MFA."
-        ACCESS_TOKEN="$SAVED_TOKEN"
-    else
-        echo "Expired or invalid."
-        rm -f "$CACHE_FILE"
-    fi
+if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+    echo "Authentication failed. Please verify your password and MFA code."
+    exit 1
 fi
 
-# If no valid token, trigger the MFA workflow
-if [ -z "$ACCESS_TOKEN" ]; then
-    echo -n "Enter password for $USERNAME: "
-    read -s PASSWORD
-    echo ""
-    echo -n "Enter 6-digit MFA Code: "
-    read -r MFA_CODE
-    echo ""
+echo "Authenticated successfully! Fetching deployments..."
 
-    echo "Exchanging credentials for an OAuth2 Bearer token..."
-
-    TOKEN_RESPONSE=$(curl -s \
-      -H "Content-Type: application/x-www-form-urlencoded;charset=utf-8" \
-      -H "Accept: application/json;charset=utf-8" \
-      -H "Authorization: Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0" \
-      -X POST "$LOGIN_URL" \
-      -d "username=$USERNAME" \
-      -d "password=$PASSWORD" \
-      -d "grant_type=password" \
-      -d "mfa_token=$MFA_CODE")
-
-    ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\(.*\)"/\1/')
-
-    if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-        echo "Authentication failed. Could not retrieve token."
-        exit 1
-    fi
-
-    # Save token to cache file
-    echo "$ACCESS_TOKEN" > "$CACHE_FILE"
-    chmod 600 "$CACHE_FILE" # Restrict file permissions for security
-    echo "New token cached successfully."
-fi
-
-# --- Main Data Processing ---
-echo "Fetching deployments for environment '$ENVIRONMENT'..."
-
+# 1. Get all deployed proxies and their revisions
 DEPLOYMENTS_JSON=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
   "$MGMT_URL/organizations/$ORGANIZATION/environments/$ENVIRONMENT/deployments")
+
+PROXIES=$(echo "$DEPLOYMENTS_JSON" | jq -r '.aPIProxy[].name')
+
+if [ -z "$PROXIES" ] || [ "$PROXIES" = "null" ]; then
+    echo "No deployed proxies found in this environment."
+    exit 0
+fi
 
 echo "----------------------------------------------------------------------"
 printf "%-35s %-10s %-s\n" "PROXY NAME" "REVISION" "BASEPATH"
 echo "----------------------------------------------------------------------"
 
-echo "$DEPLOYMENTS_JSON" | sed 's/{"name"/\n{"name"/g' | while read -r PROXY_BLOCK; do
-    [[ "$PROXY_BLOCK" != *"\"name\""* ]] && continue
+# 2. Loop through each deployed proxy
+echo "$PROXIES" | while read -r PROXY_NAME; do
+    [ -z "$PROXY_NAME" ] && continue
 
-    PROXY_NAME=$(echo "$PROXY_BLOCK" | sed -n 's/^.*{"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    REV=$(echo "$PROXY_BLOCK" | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*[[{]*[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p')
+    REVISION=$(echo "$DEPLOYMENTS_JSON" | jq -r --arg proxy "$PROXY_NAME" '.aPIProxy[] | select(.name==$proxy) | .revision[].name')
 
-    if [ -z "$PROXY_NAME" ] || [ -z "$REV" ]; then
-        continue
-    fi
+    for REV in $REVISION; do
+        
+        # 3. Fetch the proxy revision details
+        PROXY_DETAILS=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+          "$MGMT_URL/organizations/$ORGANIZATION/apis/$PROXY_NAME/revisions/$REV")
+        
+        # FIXED JQ FILTER:
+        # Pulls the actual basepath value from configuration.proxyEndpoints[].connection.basePath
+        BASEPATHS=$(echo "$PROXY_DETAILS" | jq -r '.configuration.proxyEndpoints[].connection.basePath?' 2>/dev/null | paste -sd ", " -)
+        
+        # Fallback 1: Some Apigee Edge variations keep a top-level flat string list
+        if [ -z "$BASEPATHS" ] || [ "$BASEPATHS" = "null" ]; then
+             BASEPATHS=$(echo "$PROXY_DETAILS" | jq -r '.basepaths[]?' 2>/dev/null | paste -sd ", " -)
+        fi
 
-    PROXY_DETAILS=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
-      "$MGMT_URL/organizations/$ORGANIZATION/apis/$PROXY_NAME/revisions/$REV")
+        # Fallback 2: Direct lookup if the configuration structure is omitted
+        if [ -z "$BASEPATHS" ] || [ "$BASEPATHS" = "null" ]; then
+             BASEPATHS=$(echo "$PROXY_DETAILS" | jq -r '.proxyEndpoints[].connection.basePath?' 2>/dev/null | paste -sd ", " -)
+        fi
 
-    BASEPATHS=$(echo "$PROXY_DETAILS" | sed 's/,"/\n/g' | grep '"basepath"' | sed -n 's/.*"basepath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr '\n' ',' | sed 's/,$//')
+        # Final cleanup if nothing resolves
+        if [ -z "$BASEPATHS" ] || [ "$BASEPATHS" = "null" ]; then
+            BASEPATHS="/"
+        fi
 
-    if [ -z "$BASEPATHS" ] || [ "$BASEPATHS" = "null" ]; then
-        BASEPATHS=$(echo "$PROXY_DETAILS" | sed 's/ proxyEndpoints/\nproxyEndpoints/g' | grep -o '"/.*"' | tr -d '"' | tr '\n' ',' | sed 's/,$//')
-    fi
-
-    if [ -z "$BASEPATHS" ]; then BASEPATHS="/"; fi
-
-    printf "%-35s %-10s %-s\n" "$PROXY_NAME" "$REV" "$BASEPATHS"
+        printf "%-35s %-10s %-s\n" "$PROXY_NAME" "$REV" "$BASEPATHS"
+    done
 done
