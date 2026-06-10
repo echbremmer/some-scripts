@@ -1,47 +1,84 @@
-Bash
-
 #!/bin/bash
 
 # --- Configuration ---
 MGMT_URL="https://api.enterprise.apigee.com/v1"
 LOGIN_URL="https://login.apigee.com/oauth/token"
+CACHE_FILE=".apigee_token_cache"
 
 ORGANIZATION="your-org-name"
 ENVIRONMENT="your-env-name"
 USERNAME="your-email@example.com"
 
-# --- Authentication with MFA ---
-echo -n "Enter password for $USERNAME: "
-read -s PASSWORD
-echo ""
-echo -n "Enter 6-digit MFA Code: "
-read -r MFA_CODE
-echo ""
+# --- Token Validation Function ---
+is_token_valid() {
+    local token=$1
+    if [ -z "$token" ]; then return 1; fi
+    
+    # Test the token with a lightweight API call (listing environments)
+    local test_call
+    test_call=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $token" "$MGMT_URL/organizations/$ORGANIZATION/environments")
+    
+    if [ "$test_call" = "200" ]; then
+        return 0 # Token is valid
+    else
+        return 1 # Token is expired or invalid
+    fi
+}
 
-echo "Exchanging credentials for an OAuth2 Bearer token..."
+# --- Authentication Logic ---
+ACCESS_TOKEN=""
 
-# Fetch the OAuth2 token
-TOKEN_RESPONSE=$(curl -s \
-  -H "Content-Type: application/x-www-form-urlencoded;charset=utf-8" \
-  -H "Accept: application/json;charset=utf-8" \
-  -H "Authorization: Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0" \
-  -X POST "$LOGIN_URL" \
-  -d "username=$USERNAME" \
-  -d "password=$PASSWORD" \
-  -d "grant_type=password" \
-  -d "mfa_token=$MFA_CODE")
-
-# Extract access token
-ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-
-if [ -z "$ACCESS_TOKEN" ]; then
-    echo "Authentication failed. Please verify your password and MFA code."
-    exit 1
+# Try to load token from cache
+if [ -f "$CACHE_FILE" ]; then
+    printf "Found cached token. Checking validity... "
+    SAVED_TOKEN=$(cat "$CACHE_FILE")
+    
+    if is_token_valid "$SAVED_TOKEN"; then
+        echo "Valid! Skipping MFA."
+        ACCESS_TOKEN="$SAVED_TOKEN"
+    else
+        echo "Expired or invalid."
+        rm -f "$CACHE_FILE"
+    fi
 fi
 
-echo "Authenticated successfully! Fetching deployments..."
+# If no valid token, trigger the MFA workflow
+if [ -z "$ACCESS_TOKEN" ]; then
+    echo -n "Enter password for $USERNAME: "
+    read -s PASSWORD
+    echo ""
+    echo -n "Enter 6-digit MFA Code: "
+    read -r MFA_CODE
+    echo ""
 
-# 1. Get all deployed proxies
+    echo "Exchanging credentials for an OAuth2 Bearer token..."
+
+    TOKEN_RESPONSE=$(curl -s \
+      -H "Content-Type: application/x-www-form-urlencoded;charset=utf-8" \
+      -H "Accept: application/json;charset=utf-8" \
+      -H "Authorization: Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0" \
+      -X POST "$LOGIN_URL" \
+      -d "username=$USERNAME" \
+      -d "password=$PASSWORD" \
+      -d "grant_type=password" \
+      -d "mfa_token=$MFA_CODE")
+
+    ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\(.*\)"/\1/')
+
+    if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+        echo "Authentication failed. Could not retrieve token."
+        exit 1
+    fi
+
+    # Save token to cache file
+    echo "$ACCESS_TOKEN" > "$CACHE_FILE"
+    chmod 600 "$CACHE_FILE" # Restrict file permissions for security
+    echo "New token cached successfully."
+fi
+
+# --- Main Data Processing ---
+echo "Fetching deployments for environment '$ENVIRONMENT'..."
+
 DEPLOYMENTS_JSON=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
   "$MGMT_URL/organizations/$ORGANIZATION/environments/$ENVIRONMENT/deployments")
 
@@ -49,37 +86,26 @@ echo "----------------------------------------------------------------------"
 printf "%-35s %-10s %-s\n" "PROXY NAME" "REVISION" "BASEPATH"
 echo "----------------------------------------------------------------------"
 
-# Separate the payload by individual "aPIProxy" blocks by injecting newlines
-# This prevents cross-contamination between different proxies' fields
 echo "$DEPLOYMENTS_JSON" | sed 's/{"name"/\n{"name"/g' | while read -r PROXY_BLOCK; do
-    # Skip lines that don't actually contain a proxy definition
     [[ "$PROXY_BLOCK" != *"\"name\""* ]] && continue
 
-    # Extract the Proxy Name (guaranteed to be the first name key in the isolated block)
     PROXY_NAME=$(echo "$PROXY_BLOCK" | sed -n 's/^.*{"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    
-    # Extract the Revision Number (specifically targets the text inside the "revision" array nested block)
     REV=$(echo "$PROXY_BLOCK" | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*[[{]*[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p')
 
-    # Guard check to ensure we parsed both values successfully
     if [ -z "$PROXY_NAME" ] || [ -z "$REV" ]; then
         continue
     fi
 
-    # 2. Fetch the proxy revision endpoint payload to get the basepath
     PROXY_DETAILS=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
       "$MGMT_URL/organizations/$ORGANIZATION/apis/$PROXY_NAME/revisions/$REV")
 
-    # Extract basepath fields reliably
     BASEPATHS=$(echo "$PROXY_DETAILS" | sed 's/,"/\n/g' | grep '"basepath"' | sed -n 's/.*"basepath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr '\n' ',' | sed 's/,$//')
 
-    # Fallback structure logic if nested deep inside proxyEndpoints array strings
     if [ -z "$BASEPATHS" ] || [ "$BASEPATHS" = "null" ]; then
         BASEPATHS=$(echo "$PROXY_DETAILS" | sed 's/ proxyEndpoints/\nproxyEndpoints/g' | grep -o '"/.*"' | tr -d '"' | tr '\n' ',' | sed 's/,$//')
     fi
 
     if [ -z "$BASEPATHS" ]; then BASEPATHS="/"; fi
 
-    # Output row results cleanly
     printf "%-35s %-10s %-s\n" "$PROXY_NAME" "$REV" "$BASEPATHS"
 done
