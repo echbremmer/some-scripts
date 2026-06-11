@@ -29,15 +29,15 @@ fi
 PASSWORD=$(get_password)
 MFA_CODE=$(get_mfa_code)
 
-# Send the POST request to obtain an access token
+# Send the POST request to obtain an access token using -d option
 response=$(curl -s \
     --request POST \
     --url https://login.apigee.com/oauth/token \
     --header "Authorization: Basic $(echo -n "$APGEE_CLIENT_ID:$APGEE_CLIENT_SECRET" | base64)" \
-    --form grant_type=password \
-    --form username="$APIGEE_USER" \
-    --form password="$PASSWORD" \
-    --form mfa_code="$MFA_CODE")
+    --data-urlencode "grant_type=password" \
+    --data-urlencode "username=$APIGEE_USER" \
+    --data-urlencode "password=$PASSWORD" \
+    --data-urlencode "mfa_code=$MFA_CODE")
 
 # Extract the access token from the response
 access_token=$(echo "$response" | jq -r '.access_token')
