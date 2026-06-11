@@ -5,63 +5,59 @@ ORG_NAME="your_org_name"
 ENVIRONMENT="your_environment"
 APIGEE_USER="your_apigee_user_email"
 
-# Function to get the MFA code (you need to implement this part)
+# Function to get the MFA code interactively
 get_mfa_code() {
-  # You can use a tool like oathtool or google-authenticator-cli to generate the TOTP
-  # For example:
-  # oathtool --totp='YOUR_SECRET_KEY'
-  echo "Enter your MFA code:"
-  read -r mfa_code
+  read -r -s -p "Enter your MFA code: " mfa_code
+  echo # Move to the next line after input
   echo "$mfa_code"
 }
 
-# Get an access token (this is a simplified example, consider using a library for OAuth2)
-get_access_token() {
-  local username="$1"
-  local password="$2"
-  local mfa_code="$3"
-
-  curl -s -X POST "https://login.apigee.com/oauth/token" \
-    -d "grant_type=password" \
-    -d "username=$username" \
-    -d "password=$password" \
-    -d "mfa-otp=$mfa_code" \
-    -d "client_id=apigeecli" \
-    -d "client_secret=your_edgecli_client_secret"
+# Function to get the password interactively
+get_password() {
+  read -r -s -p "Enter your Apigee Password: " password
+  echo # Move to the next line after input
+  echo "$password"
 }
 
-# Get the proxies and extract basepaths
-get_proxies_basepaths() {
-  local access_token="$1"
-
-  # Fetch the list of proxies
-  curl -s -H "Authorization: Bearer $access_token" \
-       "https://api.enterprise.apigee.com/v1/organizations/$ORG_NAME/environments/$ENVIRONMENT/apis" | jq -r '.[].proxyName' |
-  while read -r proxy_name; do
-    # Get the basepath for each proxy
-    curl -s -H "Authorization: Bearer $access_token" \
-         "https://api.enterprise.apigee.com/v1/organizations/$ORG_NAME/apis/$proxy_name/revisions/latest/proxies/default" | jq -r '.BasePaths[0]'
-  done
-}
-
-# Main execution flow
-if [[ $# -ne 2 ]]; then
-  echo "Usage: $0 <password> <client_secret>"
+# Ensure client_id and client_secret are set in environment variables
+if [[ -z "$APGEE_CLIENT_ID" || -z "$APGEE_CLIENT_SECRET" ]]; then
+  echo "Error: APGEE_CLIENT_ID or APGEE_CLIENT_SECRET is not set."
   exit 1
 fi
 
-PASSWORD="$1"
-CLIENT_SECRET="$2"
-
+# Get password and MFA code from user
+PASSWORD=$(get_password)
 MFA_CODE=$(get_mfa_code)
-ACCESS_TOKEN=$(get_access_token "$APIGEE_USER" "$PASSWORD" "$MFA_CODE")
 
-if [[ -z "$ACCESS_TOKEN" ]]; then
-  echo "Failed to obtain access token."
+# Send the POST request to obtain an access token
+response=$(curl -s \
+    --request POST \
+    --url https://login.apigee.com/oauth/token \
+    --header "Authorization: Basic $(echo -n "$APGEE_CLIENT_ID:$APGEE_CLIENT_SECRET" | base64)" \
+    --form grant_type=password \
+    --form username="$APIGEE_USER" \
+    --form password="$PASSWORD" \
+    --form mfa_code="$MFA_CODE")
+
+# Extract the access token from the response
+access_token=$(echo "$response" | jq -r '.access_token')
+
+if [[ -z "$access_token" || "$access_token" == "null" ]]; then
+  echo "Error: Failed to obtain access token. Please check your credentials and try again."
   exit 1
 fi
 
-echo "Access Token: $ACCESS_TOKEN"
+# Use the obtained access token to fetch proxies in the specified environment
+proxies_response=$(curl -s \
+    --request GET \
+    --url "https://api.enterprise.apigee.com/v1/organizations/$ORG_NAME/environments/$ENVIRONMENT/apis" \
+    --header "Authorization: Bearer $access_token")
 
-# Extract and display basepaths of all proxies in the given environment
-get_proxies_basepaths "$ACCESS_TOKEN"
+# Check if there was an error fetching proxies
+if [[ $(echo "$proxies_response" | jq -e '.error' 2>/dev/null) ]]; then
+  echo "Error: Failed to fetch proxies. Please check your access token and try again."
+  exit 1
+fi
+
+# Pretty-print the list of proxies using jq
+echo "$proxies_response" | jq '.'
