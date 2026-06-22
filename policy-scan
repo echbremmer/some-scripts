@@ -4,14 +4,29 @@ set -euo pipefail
 
 # Configuration
 BUNDLE_DIR="./apigee_bundles"
+OUTPUT_MODE="text"
+
+# Check for the 'csv' option passed as an argument
+if [ "${1:-}" = "csv" ]; then
+    OUTPUT_MODE="csv"
+fi
 
 if [ ! -d "$BUNDLE_DIR" ]; then
-    echo "Error: Directory $BUNDLE_DIR does not exist. Run your download script first."
+    if [ "$OUTPUT_MODE" = "csv" ]; then
+        echo "Error,Directory $BUNDLE_DIR does not exist." >&2
+    else
+        echo "Error: Directory $BUNDLE_DIR does not exist. Run your download script first."
+    fi
     exit 1
 fi
 
-echo "=== Scanning Proxy Bundles for AM-SetScope Policies ==="
-echo "--------------------------------------------------------"
+# Print Headers based on the selected mode
+if [ "$OUTPUT_MODE" = "csv" ]; then
+    echo "Bundle,Basepath,Policy,Type,Attribute_Name,Value"
+else
+    echo "=== Scanning Proxy Bundles for AM-SetScope Policies ==="
+    echo "--------------------------------------------------------"
+fi
 
 # Loop through all downloaded zip bundles
 find "$BUNDLE_DIR" -name "*.zip" | while read -r ZIP_FILE; do
@@ -24,74 +39,79 @@ find "$BUNDLE_DIR" -name "*.zip" | while read -r ZIP_FILE; do
     unzip -q "$ZIP_FILE" -d "$TMP_DIR"
     
     # --- 1. Find and Parse the Basepath ---
-    # The default proxy endpoint file is typically under apiproxy/proxies/default.xml
-    # If named differently, we search for any file under apiproxy/proxies/
     PROXY_ENDPOINT_FILE=$(find "$TMP_DIR/apiproxy/proxies" -name "*.xml" | head -n 1)
     
     BASEPATH="UNKNOWN"
     if [ -f "$PROXY_ENDPOINT_FILE" ]; then
-        # Extract the BasePath value using xpath evaluation
         BASEPATH=$(xmllint --xpath "string(//ProxyEndpoint/HTTPProxyConnection/BasePath)" "$PROXY_ENDPOINT_FILE" 2>/dev/null || echo "NOT_FOUND")
     fi
 
     # --- 2. Scan for Target AssignMessage Policies ---
-    # Look for any XML policy file under apiproxy/policies/ starting with 'AM-SetScope'
     POLICY_FILES=$(find "$TMP_DIR/apiproxy/policies" -name "AM-SetScope*.xml" 2>/dev/null || true)
     
     if [ -z "$POLICY_FILES" ]; then
-        # No matching policies in this bundle, clean up and move on
         rm -rf "$TMP_DIR"
         continue
     fi
     
-    # Output the bundle metadata if a target policy matches
-    echo "Bundle:   $BUNDLE_NAME"
-    echo "Basepath: $BASEPATH"
-    echo "Policies Found:"
+    if [ "$OUTPUT_MODE" = "text" ]; then
+        echo "Bundle:   $BUNDLE_NAME"
+        echo "Basepath: $BASEPATH"
+        echo "Policies Found:"
+    fi
 
     # --- 3. Read and Extract Attributes from matching Policies ---
     echo "$POLICY_FILES" | while read -r POLICY_PATH; do
         POLICY_NAME=$(basename "$POLICY_PATH" .xml)
-        echo "  - Policy: $POLICY_NAME"
         
-        # Extract and print Assigned Variables (AssignTo details or Set tags)
-        # Apigee AssignMessage elements usually contain <AssignVariable> or <Set><Headers>/<Payload> etc.
-        # This extracts defined variable names and their text contents.
+        [ "$OUTPUT_MODE" = "text" ] && echo "  - Policy: $POLICY_NAME"
         
-        # Check for standard <AssignVariable> tags if used
+        # A. Check for standard <AssignVariable> tags
         VARIABLES=$(xmllint --xpath "//AssignMessage/AssignVariable/Name/text()" "$POLICY_PATH" 2>/dev/null || true)
-        
         if [ -n "$VARIABLES" ]; then
             echo "$VARIABLES" | while read -r VAR_NAME; do
-                # Get the value corresponding to this variable name
                 VAR_VAL=$(xmllint --xpath "string(//AssignMessage/AssignVariable[Name='$VAR_NAME']/Value)" "$POLICY_PATH" 2>/dev/null || echo "")
-                # If Value tag is empty, check for Ref attribute or text content
                 if [ -z "$VAR_VAL" ]; then
                     VAR_VAL=$(xmllint --xpath "string(//AssignMessage/AssignVariable[Name='$VAR_NAME']/Ref)" "$POLICY_PATH" 2>/dev/null || echo "N/A")
                 fi
-                echo "      [Variable] $VAR_NAME = $VAR_VAL"
+                
+                if [ "$OUTPUT_MODE" = "csv" ]; then
+                    echo "\"$BUNDLE_NAME\",\"$BASEPATH\",\"$POLICY_NAME\",\"Variable\",\"$VAR_NAME\",\"$VAR_VAL\""
+                else
+                    echo "      [Variable] $VAR_NAME = $VAR_VAL"
+                fi
             done
         fi
         
-        # Check for generic elements set inside <Set> tags (Headers, QueryParams, FormParams, Payload)
+        # B. Check for generic header configurations inside <Set><Headers>
         HEADERS=$(xmllint --xpath "//AssignMessage/Set/Headers/Header/@name" "$POLICY_PATH" 2>/dev/null || true)
         if [ -n "$HEADERS" ]; then
-            # Clean up attribute output format from xmllint (e.g., name="X")
             echo "$HEADERS" | tr ' ' '\n' | sed 's/name=//g' | sed 's/"//g' | while read -r H_NAME; do
                 [ -z "$H_NAME" ] && continue
                 H_VAL=$(xmllint --xpath "string(//AssignMessage/Set/Headers/Header[@name='$H_NAME'])" "$POLICY_PATH" 2>/dev/null || echo "")
-                echo "      [Header]   $H_NAME = $H_VAL"
+                
+                if [ "$OUTPUT_MODE" = "csv" ]; then
+                    echo "\"$BUNDLE_NAME\",\"$BASEPATH\",\"$POLICY_NAME\",\"Header\",\"$H_NAME\",\"$H_VAL\""
+                else
+                    echo "      [Header]   $H_NAME = $H_VAL"
+                fi
             done
         fi
 
+        # C. Check for explicit Payload strings inside <Set><Payload>
         PAYLOAD_CHECK=$(xmllint --xpath "string(//AssignMessage/Set/Payload)" "$POLICY_PATH" 2>/dev/null || true)
         if [ -n "$PAYLOAD_CHECK" ]; then
-             echo "      [Payload]  $(echo "$PAYLOAD_CHECK" | tr -d '\n' | xargs)"
+             CLEAN_PAYLOAD=$(echo "$PAYLOAD_CHECK" | tr -d '\n' | xargs)
+             if [ "$OUTPUT_MODE" = "csv" ]; then
+                 echo "\"$BUNDLE_NAME\",\"$BASEPATH\",\"$POLICY_NAME\",\"Payload\",\"N/A\",\"$CLEAN_PAYLOAD\""
+             else
+                 echo "      [Payload]  $CLEAN_PAYLOAD"
+             fi
         fi
     done
     
-    echo "--------------------------------------------------------"
+    [ "$OUTPUT_MODE" = "text" ] && echo "--------------------------------------------------------"
     
-    # Cleanup extracted workspace files
+    # Cleanup workspace files
     rm -rf "$TMP_DIR"
 done
