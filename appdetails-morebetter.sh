@@ -5,10 +5,10 @@ set -euo pipefail
 APIGEE_LOGIN_URL="https://login.apigee.com/oauth/token"
 APIGEE_MGMT_API_URL="https://api.enterprise.apigee.com/v1"
 
-# Fixed Basic Auth header for Apigee Edge OAuth client (edgecli:edgeclisecret)
+# Basic Auth header for Apigee Edge OAuth client (edgecli:edgeclisecret)
 CLIENT_AUTH_HEADER="Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0"
 
-echo "=== Apigee Edge App Extractor ==="
+echo "=== Apigee Edge App Extractor (Targeted via Developer Apps) ==="
 
 read -rp "Enter Apigee Organization name: " ORG_NAME
 read -rp "Enter API Product name: " PRODUCT_NAME
@@ -37,34 +37,32 @@ if [ -z "$ACCESS_TOKEN" ]; then
 fi
 
 echo "Authentication successful."
-echo "Fetching all apps with full details for org '$ORG_NAME'..."
+echo "Fetching developer apps for org '$ORG_NAME'..."
 
-# 2. Fetch all apps with expanded details in a single API call
-APPS_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps?expand=true" \
+# 2. Fetch developers with expanded apps/credentials
+DEV_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/developers?expand=true" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Accept: application/json")
 
-if ! echo "$APPS_RESPONSE" | jq -e '.' >/dev/null 2>&1; then
+if ! echo "$DEV_RESPONSE" | jq -e '.' >/dev/null 2>&1; then
   echo "Error: Received non-JSON response from Apigee API." >&2
-  echo "Response: $APPS_RESPONSE" >&2
+  echo "Response: $DEV_RESPONSE" >&2
   exit 1
 fi
 
-# 3. Filter the expanded app list using jq
-MATCHING_APPS=$(echo "$APPS_RESPONSE" | jq --arg prod "$PRODUCT_NAME" '
-  (if type == "object" and .app then .app elif type == "array" then . else [] end)
-  | map(
-      select(
-        .credentials[]?.apiProducts[]?.apiproduct == $prod
-      )
-    )
+# 3. Extract and flatten apps matching the target API product
+MATCHING_APPS=$(echo "$DEV_RESPONSE" | jq --arg prod "$PRODUCT_NAME" '
+  [
+    .developer[]?.apps[]? |
+    select(.credentials[]?.apiProducts[]?.apiproduct == $prod)
+  ]
 ')
 
 MATCH_COUNT=$(echo "$MATCHING_APPS" | jq 'length')
 
 echo -e "\nFound $MATCH_COUNT matching app(s):\n"
 
-# Output formatted JSON with full details (API keys included)
+# Output formatted JSON with full app details and API keys
 echo "$MATCHING_APPS" | jq '.'
 
 # Save full details to output file
