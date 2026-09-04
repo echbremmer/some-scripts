@@ -6,7 +6,7 @@ APIGEE_LOGIN_URL="https://login.apigee.com/oauth/token"
 APIGEE_MGMT_API_URL="https://api.enterprise.apigee.com/v1"
 CLIENT_AUTH_HEADER="Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0"
 
-echo "=== Apigee Edge App Extractor (Targeted) ==="
+echo "=== Apigee Edge App Extractor ==="
 
 read -rp "Enter Apigee Organization name: " ORG_NAME
 read -rp "Enter API Product name: " PRODUCT_NAME
@@ -35,50 +35,50 @@ if [ -z "$ACCESS_TOKEN" ]; then
 fi
 
 echo "Authentication successful."
-echo "Querying apps matching API product '$PRODUCT_NAME'..."
+echo "Fetching app list from organization '$ORG_NAME'..."
 
-# 2. Query apps filtered by apiProduct parameter
-# Using query parameters apiProduct and expand=apps
-PRODUCT_APPS_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps?apiProduct=$PRODUCT_NAME" \
+# 2. Get all App IDs in the org
+APPS_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Accept: application/json")
 
-# Extract app IDs or Names returned for this product
-APP_LIST=$(echo "$PRODUCT_APPS_RESPONSE" | jq -r '.[]? // .app[]? // empty')
+APP_IDS=$(echo "$APPS_RESPONSE" | jq -r '.[]?')
 
-if [ -z "$APP_LIST" ]; then
-  # Fallback: Query via developerapps search endpoint if the organization uses key-product search
-  SEARCH_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/developers?expand=true" \
-    -H "Authorization: Bearer $ACCESS_TOKEN" \
-    -H "Accept: application/json")
-fi
-
-# 3. Fetch full app details (including keys) for matching apps
-echo "Fetching full app details including API keys..."
-
-DETAILED_APPS_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps?apiProduct=$PRODUCT_NAME&expand=true" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Accept: application/json")
-
-# Process and format matching apps JSON
-MATCHING_APPS=$(echo "$DETAILED_APPS_RESPONSE" | jq '
-  if type == "array" then
-    .
-  elif .app then
-    .app
-  else
-    []
-  end
-')
-
-MATCH_COUNT=$(echo "$MATCHING_APPS" | jq 'length')
-
-if [ "$MATCH_COUNT" -eq 0 ]; then
-  echo "No apps found associated with product '$PRODUCT_NAME'."
+if [ -z "$APP_IDS" ]; then
+  echo "No apps found in organization '$ORG_NAME'."
   exit 0
 fi
 
-echo -e "\nFound $MATCH_COUNT matching app(s):\n"
+TOTAL_APPS=$(echo "$APP_IDS" | wc -l | tr -d ' ')
+echo "Found $TOTAL_APPS total app(s) in org. Querying app details in parallel to filter for product '$PRODUCT_NAME'..."
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+export APIGEE_MGMT_API_URL ORG_NAME ACCESS_TOKEN PRODUCT_NAME TMP_DIR
+
+# 3. Download full details for each app in parallel (-P 10) and save only those matching the product
+echo "$APP_IDS" | xargs -I {} -P 10 bash -c '
+  APP_ID="$1"
+  APP_DETAIL=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps/$APP_ID" \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    -H "Accept: application/json")
+
+  # Check if any credential in the app contains the target API product
+  MATCH=$(echo "$APP_DETAIL" | jq --arg prod "$PRODUCT_NAME" -r '
+    [ .credentials[]?.apiProducts[]?.apiproduct ] | contains([$prod])
+  ')
+
+  if [ "$MATCH" = "true" ]; then
+    echo "$APP_DETAIL" > "$TMP_DIR/$APP_ID.json"
+  fi
+' _ {}
+
+# 4. Combine all matching JSON files into a single array
+MATCHING_APPS=$(jq -s '.' "$TMP_DIR"/*.json 2>/dev/null || echo "[]")
+
+FETCHED_COUNT=$(echo "$MATCHING_APPS" | jq 'length')
+echo -e "\nFound $FETCHED_COUNT app(s) associated with product '$PRODUCT_NAME':\n"
 
 # Output formatted JSON to stdout
 echo "$MATCHING_APPS" | jq '.'
