@@ -4,7 +4,7 @@ set -euo pipefail
 
 APIGEE_LOGIN_URL="https://login.apigee.com/oauth/token"
 APIGEE_MGMT_API_URL="https://api.enterprise.apigee.com/v1"
-CLIENT_AUTH_HEADER="Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0"
+CLIENT_AUTH_HEADER="Basic ZWRnZWNliplZGdlY2xpc2VjcmV0"
 
 echo "=== Apigee Edge App Extractor ==="
 
@@ -17,7 +17,7 @@ read -rp "Enter MFA Code (TOTP): " MFA_CODE
 
 echo -e "\nAuthenticating with Apigee Edge..."
 
-# 1. Authenticate
+# 1. Authenticate and extract OAuth Token
 AUTH_RESPONSE=$(curl -s -X POST "$APIGEE_LOGIN_URL?mfa_token=$MFA_CODE" \
   -H "Authorization: $CLIENT_AUTH_HEADER" \
   -H "Content-Type: application/x-www-form-urlencoded" \
@@ -35,55 +35,39 @@ if [ -z "$ACCESS_TOKEN" ]; then
 fi
 
 echo "Authentication successful."
-echo "Fetching app list from organization '$ORG_NAME'..."
+echo "Fetching all apps with full details for org '$ORG_NAME'..."
 
-# 2. Get all App IDs in the org
-APPS_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps" \
+# 2. Fetch all apps with expanded details in a single API call
+APPS_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps?expand=true" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Accept: application/json")
 
-APP_IDS=$(echo "$APPS_RESPONSE" | jq -r '.[]?')
-
-if [ -z "$APP_IDS" ]; then
-  echo "No apps found in organization '$ORG_NAME'."
-  exit 0
+# Verify we got a valid JSON response from Apigee
+if ! echo "$APPS_RESPONSE" | jq -e '.' >/dev/null 2>&1; then
+  echo "Error: Received non-JSON response from Apigee API." >&2
+  echo "Response: $APPS_RESPONSE" >&2
+  exit 1
 fi
 
-TOTAL_APPS=$(echo "$APP_IDS" | wc -l | tr -d ' ')
-echo "Found $TOTAL_APPS total app(s) in org. Querying app details in parallel to filter for product '$PRODUCT_NAME'..."
+# 3. Filter the expanded app list using jq
+MATCHING_APPS=$(echo "$APPS_RESPONSE" | jq --arg prod "$PRODUCT_NAME" '
+  # Handle both object wrapper {.app: [...]} and raw array [...]
+  (if type == "object" and .app then .app elif type == "array" then . else [] end)
+  | map(
+      select(
+        .credentials[]?.apiProducts[]?.apiproduct == $prod
+      )
+    )
+')
 
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+MATCH_COUNT=$(echo "$MATCHING_APPS" | jq 'length')
 
-export APIGEE_MGMT_API_URL ORG_NAME ACCESS_TOKEN PRODUCT_NAME TMP_DIR
+echo -e "\nFound $MATCH_COUNT matching app(s):\n"
 
-# 3. Download full details for each app in parallel (-P 10) and save only those matching the product
-echo "$APP_IDS" | xargs -I {} -P 10 bash -c '
-  APP_ID="$1"
-  APP_DETAIL=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/apps/$APP_ID" \
-    -H "Authorization: Bearer $ACCESS_TOKEN" \
-    -H "Accept: application/json")
-
-  # Check if any credential in the app contains the target API product
-  MATCH=$(echo "$APP_DETAIL" | jq --arg prod "$PRODUCT_NAME" -r '
-    [ .credentials[]?.apiProducts[]?.apiproduct ] | contains([$prod])
-  ')
-
-  if [ "$MATCH" = "true" ]; then
-    echo "$APP_DETAIL" > "$TMP_DIR/$APP_ID.json"
-  fi
-' _ {}
-
-# 4. Combine all matching JSON files into a single array
-MATCHING_APPS=$(jq -s '.' "$TMP_DIR"/*.json 2>/dev/null || echo "[]")
-
-FETCHED_COUNT=$(echo "$MATCHING_APPS" | jq 'length')
-echo -e "\nFound $FETCHED_COUNT app(s) associated with product '$PRODUCT_NAME':\n"
-
-# Output formatted JSON to stdout
+# Output formatted JSON with full details (API keys included)
 echo "$MATCHING_APPS" | jq '.'
 
-# Save output to file
+# Save full details to output file
 OUTPUT_FILE="${ORG_NAME}_${PRODUCT_NAME}_apps.json"
 echo "$MATCHING_APPS" | jq '.' > "$OUTPUT_FILE"
 
