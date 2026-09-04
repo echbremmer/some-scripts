@@ -4,7 +4,9 @@ set -euo pipefail
 
 APIGEE_LOGIN_URL="https://login.apigee.com/oauth/token"
 APIGEE_MGMT_API_URL="https://api.enterprise.apigee.com/v1"
-CLIENT_AUTH_HEADER="Basic ZWRnZWNliplZGdlY2xpc2VjcmV0"
+
+# Fixed Basic Auth header for Apigee Edge OAuth client (edgecli:edgeclisecret)
+CLIENT_AUTH_HEADER="Basic ZWRnZWNsaTplZGdlY2xpc2VjcmV0"
 
 echo "=== Apigee Edge App Extractor ==="
 
@@ -42,7 +44,6 @@ APPS_RESPONSE=$(curl -s -X GET "$APIGEE_MGMT_API_URL/organizations/$ORG_NAME/app
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Accept: application/json")
 
-# Verify we got a valid JSON response from Apigee
 if ! echo "$APPS_RESPONSE" | jq -e '.' >/dev/null 2>&1; then
   echo "Error: Received non-JSON response from Apigee API." >&2
   echo "Response: $APPS_RESPONSE" >&2
@@ -51,7 +52,6 @@ fi
 
 # 3. Filter the expanded app list using jq
 MATCHING_APPS=$(echo "$APPS_RESPONSE" | jq --arg prod "$PRODUCT_NAME" '
-  # Handle both object wrapper {.app: [...]} and raw array [...]
   (if type == "object" and .app then .app elif type == "array" then . else [] end)
   | map(
       select(
